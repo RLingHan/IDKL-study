@@ -22,14 +22,6 @@ triplet: true
 fb_dt: false #true
 center: false
 
-# ===== 层次化对齐模块开关 =====
-use_gca: false     # 启用GCA (替代TGSA)
-
-# ===== GCA模块参数 =====
-gca_k: 10          # K近邻数量
-gca_temp: 0.2    # InfoNCE温度参数
-
-
 # parameters
 margin: 1.3
 

@@ -21,7 +21,6 @@ from utils.rerank import re_ranking, pairwise_distance
 
 from models.extension import GraphContrastiveAlignment
 
-
 def intersect1d(tensor1, tensor2):
     #找出 tensor1 和 tensor2 中的共有元素
     return torch.unique(torch.cat([tensor1[tensor1 == val] for val in tensor2]))
@@ -293,8 +292,7 @@ class Baseline(nn.Module):
         sh_feat, sh_pl, sp_pl, sp_IN,sp_IN_p,x_sp_f,x_sp_f_p = self.backbone(inputs)
         #提取特征
 
-        # feats = sh_pl #layer4的语义输出
-        feats = 0.8 * sh_pl + 0.2 * sp_pl
+        feats = sh_pl #layer4的语义输出
 
         if not self.training:
             if feats.size(0) == 2048:
@@ -320,10 +318,13 @@ class Baseline(nn.Module):
         metric = {}
         loss = 0
 
-        # if self.triplet:
-        #     triplet_loss, dist, sh_ap, sh_an = self.triplet_loss(feat.float(), labels)
-        #     triplet_loss_im, _, sp_ap, sp_an = self.triplet_loss(sp_pl.float(), labels)
-        #     trip_loss = triplet_loss + triplet_loss_im
+        if self.triplet:
+
+            triplet_loss, dist, sh_ap, sh_an = self.triplet_loss(feat.float(), labels) # 归一化的layer4后特别特征
+            triplet_loss_im, _, sp_ap, sp_an = self.triplet_loss(sp_pl.float(), labels)
+            trip_loss = triplet_loss + triplet_loss_im
+            loss += trip_loss
+            metric.update({'tri': trip_loss.data})
 
         # ===== 分离V和I模态特征 =====
         feat_v = feat[sub == 0] #共享的可见光
@@ -335,68 +336,16 @@ class Baseline(nn.Module):
 
         bb = 120  #90
 
-        if self.triplet:
-            # 原始triplet loss
-            triplet_loss, dist, sh_ap, sh_an = self.triplet_loss(feat.float(), labels)
-            triplet_loss_im, _, sp_ap, sp_an = self.triplet_loss(sp_pl.float(), labels)
-
-            # 新增:跨模态Hard Triplet Mining（加强版，带检查）
-            cross_modal_tri = torch.tensor(0.0, device=feat.device)
-            if feat_v.size(0) > 0 and feat_i.size(0) > 0 and len(labels_v) > 0 and len(labels_i) > 0:
-                # 检查是否有共同类别
-                common_ids = torch.unique(labels_v[torch.isin(labels_v, labels_i)])
-
-                if len(common_ids) > 0:
-                    # 计算跨模态距离矩阵
-                    dist_vi = pairwise_dist(feat_v, feat_i)
-
-                    # 对于每个V样本,找最难的I正样本和负样本
-                    mask_pos = labels_v.unsqueeze(1) == labels_i.unsqueeze(0)
-                    mask_neg = ~mask_pos
-
-                    # 检查是否有有效的正负样本对
-                    if mask_pos.any() and mask_neg.any():
-                        # Hard positive mining (同类中最远的)
-                        dist_ap_vi = dist_vi.clone()
-                        dist_ap_vi[~mask_pos] = -1e9
-                        has_pos = mask_pos.any(dim=1)
-                        hard_ap_vi = dist_ap_vi.max(dim=1)[0]
-
-                        # Hard negative mining (异类中最近的)
-                        dist_an_vi = dist_vi.clone()
-                        dist_an_vi[~mask_neg] = 1e9
-                        has_neg = mask_neg.any(dim=1)
-                        hard_an_vi = dist_an_vi.min(dim=1)[0]
-
-                        # 只对有有效正负样本的位置计算loss
-                        valid_mask = has_pos & has_neg
-                        if valid_mask.any():
-                            cross_modal_tri = F.relu(
-                                hard_ap_vi[valid_mask] - hard_an_vi[valid_mask] + self.margin
-                            ).mean()
-
-            trip_loss = triplet_loss + triplet_loss_im
-            if cross_modal_tri.item() > 0:
-                trip_loss = trip_loss + 0.5 * cross_modal_tri
-                metric.update({'tri_cm': cross_modal_tri.data})
-
-            loss += trip_loss
-            metric.update({'tri': trip_loss.data})
-
         # ===== 核心创新1: GCA (替代TGSA) =====
         if self.use_gca and feat_v.size(0) > 0 and feat_i.size(0) > 0:
             # 对共享特征应用GCA
-            gca_loss_rank = self.gca_module(feat_v, feat_i, labels[sub == 0],is_shared = True)
-            gca_loss_rank = gca_loss_rank*100
+            gca_loss_sh = self.gca_module(feat_v, feat_i, labels[sub == 0],is_shared = True)
             # 对特定特征也应用GCA
-            gca_loss_id = self.gca_module(feat_v, feat_i, labels[sub == 0],is_shared = False)
-            gca_loss_id = gca_loss_id*100
+            gca_loss_sp = self.gca_module(sp_pl_v, sp_pl_i, labels[sub == 0],is_shared = False)
 
-            gca_loss = 0.5 * gca_loss_rank + 0.5 * gca_loss_id
-
+            gca_loss = 0.5 * gca_loss_sh + 0.5 * gca_loss_sp
+            gca_loss = 200 * gca_loss
             loss += gca_loss
-            metric.update({'gca_rank': gca_loss_rank.data})
-            metric.update({'gca_id': gca_loss_id.data})
             metric.update({'gca': gca_loss.data})
 
         # TGSA
@@ -501,47 +450,40 @@ class Baseline(nn.Module):
 
 
 
-        self.csa_warmup_epochs = 10  # 前10个epoch线性增加CSA权重
 
         if self.classification:
             logits = self.classifier(feat)
             if self.CSA1 or self.CSA2:
-                # 动态权重调整
-                if epoch < self.csa_warmup_epochs:
-                    # 预热阶段:线性增长
-                    csa_weight = 0.3 + 0.5 * (epoch / self.csa_warmup_epochs)
-                else:
-                    # 稳定阶段
-                    csa_weight = 0.8
-
                 if self.CSA1:
-                    _, inter_bg_v = Bg_kl(logits[sub == 0], logits_sp[sub == 0])
-                    _, inter_bg_i = Bg_kl(logits[sub == 1], logits_sp[sub == 1])
-                    _, intra_bg = Bg_kl(logits[sub == 0], logits[sub == 1])
+                    _, inter_bg_v = Bg_kl(logits[sub == 0], logits_sp[sub == 0]) #强制共享可见光 Logits 模仿特定可见光 Logits
+                    _, inter_bg_i = Bg_kl(logits[sub == 1], logits_sp[sub == 1]) #强制共享红外光 Logits 模仿特定可见光 Logits
+
+                    _, intra_bg = Bg_kl(logits[sub == 0], logits[sub == 1]) #共享和红外对齐
+
 
                     if feat.size(0) == bb:
-                        bg_loss = intra_bg + (inter_bg_v + inter_bg_i) * csa_weight
+                        bg_loss = intra_bg + (inter_bg_v + inter_bg_i) * 0.8  # intra_bg + (inter_bg_v + inter_bg_i) * 0.7
+
                     else:
                         bg_loss = intra_bg + (inter_bg_v + inter_bg_i) * 0.3
-
                     loss += bg_loss
                     metric.update({'bg_kl': bg_loss.data})
 
                 if self.CSA2:
-                    _, inter_Sm_v = Sm_kl(logits[sub == 0], logits_sp[sub == 0], labels)
+                    _, inter_Sm_v = Sm_kl(logits[sub == 0], logits_sp[sub == 0], labels) # sh Logits 在批次内语义结构上模仿sp Logits
                     _, inter_Sm_i = Sm_kl(logits[sub == 1], logits_sp[sub == 1], labels)
-                    inter_Sm = inter_Sm_v + inter_Sm_i
-                    _, intra_Sm = Sm_kl(logits[sub == 0], logits[sub == 1], labels)
+                    inter_Sm = inter_Sm_v + inter_Sm_i # 隐式蒸馏
+                    _, intra_Sm = Sm_kl(logits[sub == 0], logits[sub == 1], labels) #模态互相学习
 
                     if feat.size(0) == bb:
-                        sm_kl_loss = intra_Sm + inter_Sm * csa_weight
-                    else:
-                        sm_kl_loss = intra_Sm + inter_sm * 0.3
+                        sm_kl_loss = intra_Sm + inter_Sm * 0.8
 
+                    else:
+                        sm_kl_loss = intra_Sm + inter_Sm * 0.3
                     loss += sm_kl_loss
                     metric.update({'sm_kl': sm_kl_loss.data})
 
-            cls_loss = self.id_loss(logits.float(), labels)
+            cls_loss = self.id_loss(logits.float(), labels) # 基础识别id的能力
             loss += cls_loss
             metric.update({'acc': calc_acc(logits.data, labels), 'ce': cls_loss.data})
 

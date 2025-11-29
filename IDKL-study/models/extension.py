@@ -3,132 +3,126 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-def gem(x, p=3, eps=1e-6):
-    return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1. / p)
-
-
 class GraphContrastiveAlignment(nn.Module):
     """
-    GCA: 基于身份的模态不变拓扑对齐
-
-    核心理解：
-    - V和I样本不是一一对应的（不同视角）
-    - 但同ID的V样本集和I样本集应该有相同的"群体结构"
-    - 比较的是：ID级别的拓扑关系，而非样本级别
+    GCA (Graph Contrastive Alignment) - 图对比对齐
+    创新1: 双层邻居系统（共同邻居 vs 特异邻居）
+    创新2: 模态特异性保护器（对抗式保护）
+    修复: 确保损失为正值
     """
 
-    def __init__(self, k_neighbors=10, temperature=0.15):
+    def __init__(self, k_neighbors=8, temperature=0.15, common_ratio=0.6):
         super(GraphContrastiveAlignment, self).__init__()
         self.k = k_neighbors
         self.temperature = temperature
+        self.common_ratio = common_ratio
 
-    def identity_level_topology_alignment(self, feat_v, feat_i, labels_v, labels_i):
+        # 模态特异性判别器
+        self.modality_discriminator = nn.Sequential(
+            nn.Linear(2048, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 2)
+        )
+
+        self.NEG_INF = -65000.0
+
+    def build_dual_neighbor_graph(self, feat_v, feat_i, labels):
         """
-        策略1：身份级别拓扑对齐（核心创新）
-
-        思路：
-        1. 不比较单个V样本和单个I样本（因为不对应）
-        2. 比较ID_A的V样本集 和 ID_A的I样本集 的内部结构
-        3. 再比较ID_A和ID_B之间的关系在V和I中是否一致
+        双层邻居系统（核心创新）
+        返回：共同邻居、V特异邻居、I特异邻居
         """
-        unique_ids = torch.unique(labels_v)
-        if len(unique_ids) < 2:
-            return torch.tensor(0.0, device=feat_v.device)
+        if feat_v.dim() > 2:
+            feat_v = gem(feat_v).squeeze()
+            feat_v = feat_v.view(feat_v.size(0), -1)
+        if feat_i.dim() > 2:
+            feat_i = gem(feat_i).squeeze()
+            feat_i = feat_i.view(feat_i.size(0), -1)
 
-        # 为每个ID计算其在V和I模态下的"中心表示"和"分布特性"
-        id_centers_v = []
-        id_centers_i = []
-        id_spreads_v = []  # 类内散度
-        id_spreads_i = []
-        valid_ids = []
+        B = feat_v.size(0)
 
-        for pid in unique_ids:
-            mask_v = (labels_v == pid)
-            mask_i = (labels_i == pid)
+        feat_v_norm = F.normalize(feat_v.float(), p=2, dim=1)
+        feat_i_norm = F.normalize(feat_i.float(), p=2, dim=1)
 
-            if mask_v.sum() < 2 or mask_i.sum() < 2:
+        sim_v = torch.mm(feat_v_norm, feat_v_norm.t())
+        sim_i = torch.mm(feat_i_norm, feat_i_norm.t())
+
+        label_mask = labels.unsqueeze(1) == labels.unsqueeze(0)
+        label_mask.fill_diagonal_(False)
+
+        same_class_counts = label_mask.sum(dim=1)
+        if same_class_counts.max() == 0:
+            return None, None, None
+
+        common_neighbors = []
+        specific_v_neighbors = []
+        specific_i_neighbors = []
+
+        k_common = max(1, int(self.k * self.common_ratio))
+        k_specific = self.k - k_common
+
+        for i in range(B):
+            num_same_class = same_class_counts[i].item()
+            if num_same_class == 0:
+                common_neighbors.append(torch.tensor([], dtype=torch.long, device=feat_v.device))
+                specific_v_neighbors.append(torch.tensor([], dtype=torch.long, device=feat_v.device))
+                specific_i_neighbors.append(torch.tensor([], dtype=torch.long, device=feat_v.device))
                 continue
 
-            fv = feat_v[mask_v]  # [N_v, D]
-            fi = feat_i[mask_i]  # [N_i, D]
+            # V模态邻居
+            sim_v_i = sim_v[i].clone()
+            sim_v_i[~label_mask[i]] = self.NEG_INF
+            k_v = min(self.k * 2, num_same_class)
+            _, neighbors_v = torch.topk(sim_v_i, k_v)
 
-            # 计算中心
-            center_v = fv.mean(dim=0)  # [D]
-            center_i = fi.mean(dim=0)  # [D]
+            # I模态邻居
+            sim_i_i = sim_i[i].clone()
+            sim_i_i[~label_mask[i]] = self.NEG_INF
+            k_i = min(self.k * 2, num_same_class)
+            _, neighbors_i = torch.topk(sim_i_i, k_i)
 
-            # 计算类内散度（标准差）
-            spread_v = torch.std(fv, dim=0).mean()  # scalar
-            spread_i = torch.std(fi, dim=0).mean()  # scalar
+            # 计算交集和差集
+            neighbors_v_set = set(neighbors_v.cpu().numpy())
+            neighbors_i_set = set(neighbors_i.cpu().numpy())
 
-            id_centers_v.append(center_v)
-            id_centers_i.append(center_i)
-            id_spreads_v.append(spread_v)
-            id_spreads_i.append(spread_i)
-            valid_ids.append(pid)
+            common = neighbors_v_set & neighbors_i_set
+            specific_v = neighbors_v_set - common
+            specific_i = neighbors_i_set - common
 
-        if len(valid_ids) < 2:
-            return torch.tensor(0.0, device=feat_v.device)
+            # 限制数量
+            common = torch.tensor(list(common)[:k_common], dtype=torch.long, device=feat_v.device)
+            specific_v = torch.tensor(list(specific_v)[:k_specific], dtype=torch.long, device=feat_v.device)
+            specific_i = torch.tensor(list(specific_i)[:k_specific], dtype=torch.long, device=feat_v.device)
 
-        # 转换为tensor
-        centers_v = torch.stack(id_centers_v)  # [num_ids, D]
-        centers_i = torch.stack(id_centers_i)  # [num_ids, D]
-        spreads_v = torch.stack(id_spreads_v)  # [num_ids]
-        spreads_i = torch.stack(id_spreads_i)  # [num_ids]
+            common_neighbors.append(common)
+            specific_v_neighbors.append(specific_v)
+            specific_i_neighbors.append(specific_i)
 
-        # Loss 1: ID中心之间的拓扑对齐
-        # 计算ID间的相似度矩阵
-        centers_v_norm = F.normalize(centers_v, p=2, dim=1)
-        centers_i_norm = F.normalize(centers_i, p=2, dim=1)
+        return common_neighbors, specific_v_neighbors, specific_i_neighbors
 
-        sim_matrix_v = torch.mm(centers_v_norm, centers_v_norm.t())  # [num_ids, num_ids]
-        sim_matrix_i = torch.mm(centers_i_norm, centers_i_norm.t())  # [num_ids, num_ids]
-
-        # 对齐ID间的关系结构
-        loss_inter_id = F.mse_loss(sim_matrix_v, sim_matrix_i)
-
-        # Loss 2: 类内散度对齐（创新点）
-        # 同一个ID在V和I中的"紧密程度"应该一致
-        loss_intra_spread = F.mse_loss(spreads_v, spreads_i)
-
-        return loss_inter_id + 0.5 * loss_intra_spread
-
-    def intra_identity_consistency(self, feat_v, feat_i, labels_v, labels_i):
-        """
-        策略2：类内一致性约束（保留你的有效发现）
-
-        思路：
-        - 同ID的V样本之间的相似性分布
-        - 应该和同ID的I样本之间的相似性分布一致
-        - 这是你说的"误打误撞"的本质
-        """
-        unique_ids = torch.unique(labels_v)
+    def alignment_loss(self, feat_v, feat_i, common_neighbors):
+        """对齐共同邻居"""
         total_loss = 0.0
         valid_count = 0
 
-        for pid in unique_ids:
-            mask_v = (labels_v == pid)
-            mask_i = (labels_i == pid)
-
-            fv = feat_v[mask_v]
-            fi = feat_i[mask_i]
-
-            if fv.size(0) < 2 or fi.size(0) < 2:
+        for i in range(len(common_neighbors)):
+            common = common_neighbors[i]
+            if len(common) == 0:
                 continue
 
-            # 归一化
-            fv_norm = F.normalize(fv, p=2, dim=1)
-            fi_norm = F.normalize(fi, p=2, dim=1)
+            feat_v_i = feat_v[i:i+1]
+            feat_i_i = feat_i[i:i+1]
+            feat_common_v = feat_v[common]
+            feat_common_i = feat_i[common]
 
-            # 类内相似度矩阵
-            sim_v = torch.mm(fv_norm, fv_norm.t())  # [N_v, N_v]
-            sim_i = torch.mm(fi_norm, fi_norm.t())  # [N_i, N_i]
+            feat_v_i_norm = F.normalize(feat_v_i, p=2, dim=1)
+            feat_i_i_norm = F.normalize(feat_i_i, p=2, dim=1)
+            feat_common_v_norm = F.normalize(feat_common_v, p=2, dim=1)
+            feat_common_i_norm = F.normalize(feat_common_i, p=2, dim=1)
 
-            # 匹配尺寸
-            min_size = min(sim_v.size(0), sim_i.size(0))
-            sim_v = sim_v[:min_size, :min_size]
-            sim_i = sim_i[:min_size, :min_size]
+            sim_v = torch.mm(feat_v_i_norm, feat_common_v_norm.t()) / self.temperature
+            sim_i = torch.mm(feat_i_i_norm, feat_common_i_norm.t()) / self.temperature
 
-            # 相似度分布对齐
             loss = F.mse_loss(sim_v, sim_i)
             total_loss += loss
             valid_count += 1
@@ -138,129 +132,62 @@ class GraphContrastiveAlignment(nn.Module):
 
         return total_loss / valid_count
 
-    def cross_identity_ranking_consistency(self, feat_v, feat_i, labels_v, labels_i):
+    def diversity_preservation_loss(self, feat_v, feat_i, specific_v, specific_i):
         """
-        策略3：跨身份排序一致性（核心创新）
-
-        思路：
-        对于任意ID_A的某个V样本：
-        1. 找到其在V模态中最相似的K个其他ID（可能包含ID_B, ID_C...）
-        2. 对ID_A的任意I样本，也找其最相似的K个其他ID
-        3. 这两个"ID邻居集合"应该有较大重叠
-
-        关键：比较的是ID级别的邻域，而非样本级别
+        保护特异邻居（核心创新 - 修复版）
+        修复：改用正向约束，不用负号
         """
-        unique_ids = torch.unique(labels_v)
-        if len(unique_ids) < 3:  # 至少需要3个ID才能比较邻域
+        all_specific_v = []
+        all_specific_i = []
+
+        for i in range(len(specific_v)):
+            if len(specific_v[i]) > 0:
+                all_specific_v.append(feat_v[specific_v[i]])
+            if len(specific_i[i]) > 0:
+                all_specific_i.append(feat_i[specific_i[i]])
+
+        if len(all_specific_v) == 0 or len(all_specific_i) == 0:
             return torch.tensor(0.0, device=feat_v.device)
 
-        total_loss = 0.0
-        valid_count = 0
+        specific_v_feats = torch.cat(all_specific_v, dim=0)
+        specific_i_feats = torch.cat(all_specific_i, dim=0)
 
-        # 为每个ID计算其"ID级别的邻居"
-        for pid in unique_ids:
-            mask_v = (labels_v == pid)
-            mask_i = (labels_i == pid)
+        # 判别器预测
+        logits_v = self.modality_discriminator(specific_v_feats)
+        logits_i = self.modality_discriminator(specific_i_feats)
 
-            if mask_v.sum() == 0 or mask_i.sum() == 0:
-                continue
+        labels_v = torch.zeros(len(specific_v_feats), dtype=torch.long, device=feat_v.device)
+        labels_i = torch.ones(len(specific_i_feats), dtype=torch.long, device=feat_i.device)
 
-            fv = feat_v[mask_v]  # 该ID的所有V样本
-            fi = feat_i[mask_i]  # 该ID的所有I样本
+        # 修复：判别器能区分 = 损失低（正向）
+        # 我们希望判别器能区分 → 最小化交叉熵（而非最大化）
+        div_loss = F.cross_entropy(logits_v, labels_v) + F.cross_entropy(logits_i, labels_i)
 
-            # 计算该ID与其他所有样本的平均相似度（在V和I中分别计算）
-            fv_norm = F.normalize(fv, p=2, dim=1)
-            fi_norm = F.normalize(fi, p=2, dim=1)
-
-            # V模态：该ID的每个样本到所有其他ID样本的平均相似度
-            other_mask_v = (labels_v != pid)
-            if other_mask_v.sum() == 0:
-                continue
-
-            other_fv = feat_v[other_mask_v]
-            other_labels_v = labels_v[other_mask_v]
-            other_fv_norm = F.normalize(other_fv, p=2, dim=1)
-
-            # 计算该ID的V样本集与其他每个ID的平均相似度
-            sim_v = torch.mm(fv_norm, other_fv_norm.t())  # [N_v, N_other]
-            id_level_sim_v = []
-            for other_pid in torch.unique(other_labels_v):
-                mask_other = (other_labels_v == other_pid)
-                avg_sim = sim_v[:, mask_other].mean()
-                id_level_sim_v.append(avg_sim)
-            id_level_sim_v = torch.stack(id_level_sim_v)  # [num_other_ids]
-
-            # I模态：同样的计算
-            other_mask_i = (labels_i != pid)
-            if other_mask_i.sum() == 0:
-                continue
-
-            other_fi = feat_i[other_mask_i]
-            other_labels_i = labels_i[other_mask_i]
-            other_fi_norm = F.normalize(other_fi, p=2, dim=1)
-
-            sim_i = torch.mm(fi_norm, other_fi_norm.t())  # [N_i, N_other]
-            id_level_sim_i = []
-            for other_pid in torch.unique(other_labels_i):
-                mask_other = (other_labels_i == other_pid)
-                avg_sim = sim_i[:, mask_other].mean()
-                id_level_sim_i.append(avg_sim)
-            id_level_sim_i = torch.stack(id_level_sim_i)  # [num_other_ids]
-
-            # 对齐：该ID在V和I中的"ID级邻域"应该一致
-            min_len = min(len(id_level_sim_v), len(id_level_sim_i))
-            if min_len > 0:
-                loss = F.mse_loss(
-                    id_level_sim_v[:min_len],
-                    id_level_sim_i[:min_len]
-                )
-                total_loss += loss
-                valid_count += 1
-
-        if valid_count == 0:
-            return torch.tensor(0.0, device=feat_v.device)
-
-        return total_loss / valid_count
+        return div_loss  # 小权重，辅助损失
 
     def forward(self, feat_v, feat_i, labels, is_shared=True):
-        """
-        前向传播
+        """前向传播"""
+        common, spec_v, spec_i = self.build_dual_neighbor_graph(feat_v, feat_i, labels)
 
-        注意：labels是V模态的标签，但V和I应该有相同的ID分布
-        （因为是交替采样的）
-        """
-        if feat_v.size(0) == 0 or feat_i.size(0) == 0:
+        gca_loss = 0.0
+
+        if common is None:
             return torch.tensor(0.0, device=feat_v.device, requires_grad=True)
 
-        # 展平特征
-        if feat_v.dim() > 2:
-            feat_v = gem(feat_v).squeeze()
-            feat_v = feat_v.view(feat_v.size(0), -1)
-        if feat_i.dim() > 2:
-            feat_i = gem(feat_i).squeeze()
-            feat_i = feat_i.view(feat_i.size(0), -1)
-
-        # 假设V和I的labels顺序一致（因为交替采样）
-        labels_v = labels
-        labels_i = labels
-
-        total_loss = 0.0
-
         if is_shared:
-            # 共享特征：注重ID级别的全局对齐
-            loss1 = self.identity_level_topology_alignment(feat_v, feat_i, labels_v, labels_i)
-            loss2 = self.cross_identity_ranking_consistency(feat_v, feat_i, labels_v, labels_i)
-            total_loss = loss1 + 0.5 * loss2
+            # 1. 对齐共同邻居
+            align_loss = self.alignment_loss(feat_v, feat_i, common)
+            gca_loss += align_loss
 
         else:
-            # 特定特征：注重类内一致性（保留你的有效发现）
-            loss3 = self.intra_identity_consistency(feat_v, feat_i, labels_v, labels_i)
-            total_loss = loss3
+            # 2. 保护特异邻居（判别器能区分 = 损失低）
+            div_loss = self.diversity_preservation_loss(feat_v, feat_i, spec_v, spec_i)
+            gca_loss += div_loss
+
+        if torch.isnan(gca_loss) or torch.isinf(gca_loss):
+            gca_loss = torch.tensor(0.0, device=feat_v.device, requires_grad=True)
 
         # 安全检查
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            total_loss = torch.tensor(0.0, device=feat_v.device, requires_grad=True)
+        gca_loss = torch.clamp(gca_loss, min=0.0)
 
-        total_loss = torch.clamp(total_loss, min=0.0)
-
-        return total_loss
+        return gca_loss

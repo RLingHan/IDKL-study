@@ -1,6 +1,5 @@
 #models/resnet.py
 import torch.nn as nn
-import torch
 from torch.nn import functional as F
 # from torchvision.models.utils import load_state_dict_from_url   #原来
 from torch.hub import load_state_dict_from_url
@@ -318,7 +317,6 @@ class Mask(nn.Module):
         return mask
 
 
-
 class special_att(nn.Module):
     def __init__(self, dim, r=16):
         super(special_att, self).__init__()
@@ -339,6 +337,7 @@ class special_att(nn.Module):
         x_sp = x_R * mask + x_IN  # x
 
         return x_sp, x_IN
+
 
 def gem(x, p=3, eps=1e-6):
     return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1. / p)
@@ -371,7 +370,7 @@ class embed_net(nn.Module):
         #相似度计算
         if self.decompose:
             ######special structure
-            #
+
             x_sp_f = self.special(x2)
             sp_IN = self.IN(x_sp_f) # 对特有特征做 InstanceNorm，提取模态无关部分
             m_IN = self.mask1(sp_IN) # 针对无关部分的注意力
