@@ -13,7 +13,7 @@ dataset: sysu
 bg_kl: true
 sm_kl: true
 decompose: true
-distalign: false
+distalign: true
 IP: true
 classification: true
 center_cluster: false
@@ -21,12 +21,6 @@ triplet: true
 center: false
 fb_dt: false
 
-# ===== 层次化对齐模块开关 =====
-use_gca: true     # 启用GCA (替代TGSA)
-
-# ===== GCA模块参数 =====
-gca_k: 5          # K近邻数量
-gca_temp: 0.2    # InfoNCE温度参数
 
 
 # parameters
