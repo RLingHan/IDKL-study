@@ -97,10 +97,7 @@ def train(cfg):
                      sm_kl=cfg.sm_kl,
                      fb_dt=cfg.fb_dt,
                      IP=cfg.IP,
-                     distalign=cfg.distalign,
-                     use_gca=cfg.use_gca,
-                     gca_k=cfg.gca_k,
-                     gca_temp=cfg.gca_temp
+                     distalign=cfg.distalign
                      )
 
     def get_parameter_number(net):
