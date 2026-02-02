@@ -19,7 +19,6 @@ from layers.loss.center_loss import CenterLoss
 # from layers import NonLocalBlockND
 from utils.rerank import re_ranking, pairwise_distance
 
-from models.extension import GraphContrastiveAlignment
 
 def intersect1d(tensor1, tensor2):
     #找出 tensor1 和 tensor2 中的共有元素
@@ -239,9 +238,6 @@ class Baseline(nn.Module):
         self.center_loss = kwargs.get('center', False)
         self.margin = kwargs.get('margin', 0.3)
 
-        # ===== 新增：层次化对齐模块开关 =====
-        self.use_gca = kwargs.get('use_gca', False)  # 使用GCA替代TGSA
-
         # 消融实验
         self.CSA1 = kwargs.get('bg_kl', False)
         self.CSA2 = kwargs.get('sm_kl', False)
@@ -251,14 +247,6 @@ class Baseline(nn.Module):
         self.IP = kwargs.get('IP', False)
         self.fb_dt = kwargs.get('fb_dt', False)
         self.mutual_learning = kwargs.get('mutual_learning', False)
-
-        # ===== 实例化新模块 =====
-        if self.use_gca:
-            self.gca_module = GraphContrastiveAlignment(
-                k_neighbors=kwargs.get('gca_k', 8),
-                temperature=kwargs.get('gca_temp', 0.07)
-            )
-            print("[INFO] GCA module enabled (替代TGSA)")
 
         if self.decompose:
             self.classifier = nn.Linear(self.base_dim + self.dim * self.part_num, num_classes, bias=False) # 主分类器（共享特征）
@@ -326,30 +314,9 @@ class Baseline(nn.Module):
             loss += trip_loss
             metric.update({'tri': trip_loss.data})
 
-        # ===== 分离V和I模态特征 =====
-        feat_v = feat[sub == 0] #共享的可见光
-        feat_i = feat[sub == 1]
-        sp_pl_v = x_sp_f_p[sub == 0]
-        sp_pl_i = x_sp_f_p[sub == 1]
-        labels_v = labels[sub == 0]
-        labels_i = labels[sub == 1]
-
         bb = 120  #90
 
-        # ===== 核心创新1: GCA (替代TGSA) =====
-        if self.use_gca and feat_v.size(0) > 0 and feat_i.size(0) > 0:
-            # 对共享特征应用GCA
-            gca_loss_sh = self.gca_module(feat_v, feat_i, labels[sub == 0],is_shared = True)
-            # 对特定特征也应用GCA
-            gca_loss_sp = self.gca_module(sp_pl_v, sp_pl_i, labels[sub == 0],is_shared = False)
-
-            gca_loss = 0.5 * gca_loss_sh + 0.5 * gca_loss_sp
-            gca_loss = 200 * gca_loss
-            loss += gca_loss
-            metric.update({'gca': gca_loss.data})
-
-        # TGSA
-        elif self.TGSA and not self.use_gca:
+        if self.TGSA:
 
             sf_sp_dist_v = kl_soft_dist(sp_pl[sub == 0], sp_pl[sub == 0]) #可见光模态特定特征的非对角距离分布
             sf_sp_dist_i = kl_soft_dist(sp_pl[sub == 1], sp_pl[sub == 1])
