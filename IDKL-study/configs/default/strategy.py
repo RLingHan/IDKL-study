@@ -28,18 +28,6 @@ strategy_cfg.decompose = False         # 禁用特征分解损失
 strategy_cfg.fb_dt = False             # 禁用前后景差异损失
 strategy_cfg.distalign = False         # 禁用距离对齐损失
 
-# ===== 层次化对齐模块开关 =====
-strategy_cfg.use_gca = False  # 启用GCA (替代TGSA)
-
-# ===== GCA模块参数 =====
-strategy_cfg.gca_k = 8  # K近邻数量
-strategy_cfg.gca_temp = 0.07  # InfoNCE温度参数
-
-# 新模块权重
-strategy_cfg.gca = 1.0  # GCA损失权重
-strategy_cfg.spd = 1.0  # SPD损失权重
-strategy_cfg.cga = 0.5  # CGA损失权重
-strategy_cfg.cga_id = 0.1  # CGA身份保持损失权重
 
 
 # --------------------------
